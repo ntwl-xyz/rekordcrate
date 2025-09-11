@@ -91,7 +91,7 @@ pub enum PageType {
 /// Points to a table page and can be used to calculate the page's file offset by multiplying it
 /// with the page size (found in the file header).
 #[binrw]
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Default)]
 #[brw(little)]
 pub struct PageIndex(u32);
 
@@ -126,7 +126,7 @@ pub struct Table {
 
 /// The PDB header structure, including the list of tables.
 #[binrw]
-#[derive(Debug, PartialEq, Eq, Clone)]
+#[derive(Debug, PartialEq, Eq, Clone, Default)]
 #[brw(little)]
 pub struct Header {
     /// Unknown purpose, perhaps an unoriginal signature, seems to always have the value 0.
@@ -500,55 +500,55 @@ impl RowGroup {
 
 /// Identifies a track.
 #[binrw]
-#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash, PartialOrd, Ord)]
 #[brw(little)]
 pub struct TrackId(pub u32);
 
 /// Identifies an artwork item.
 #[binrw]
-#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash, PartialOrd, Ord)]
 #[brw(little)]
 pub struct ArtworkId(pub u32);
 
 /// Identifies an album.
 #[binrw]
-#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash, PartialOrd, Ord)]
 #[brw(little)]
 pub struct AlbumId(pub u32);
 
 /// Identifies an artist.
 #[binrw]
-#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash, PartialOrd, Ord)]
 #[brw(little)]
 pub struct ArtistId(pub u32);
 
 /// Identifies a genre.
 #[binrw]
-#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash, PartialOrd, Ord)]
 #[brw(little)]
 pub struct GenreId(pub u32);
 
 /// Identifies a key.
 #[binrw]
-#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash, PartialOrd, Ord)]
 #[brw(little)]
 pub struct KeyId(pub u32);
 
 /// Identifies a label.
 #[binrw]
-#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash, PartialOrd, Ord)]
 #[brw(little)]
 pub struct LabelId(pub u32);
 
 /// Identifies a playlist tree node.
 #[binrw]
-#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash)]
+#[derive(Debug, Default, PartialEq, Eq, Clone, Copy, Hash, PartialOrd, Ord)]
 #[brw(little)]
 pub struct PlaylistTreeNodeId(pub u32);
 
 /// Identifies a history playlist.
 #[binrw]
-#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash)]
+#[derive(Debug, Default, PartialEq, Eq, Clone, Copy, Hash, PartialOrd, Ord)]
 #[brw(little)]
 pub struct HistoryPlaylistId(pub u32);
 
@@ -705,7 +705,7 @@ pub struct Label {
 
 /// Represents a node in the playlist tree (either a folder or a playlist).
 #[binrw]
-#[derive(Debug, PartialEq, Eq, Clone)]
+#[derive(Debug, Default, PartialEq, Eq, Clone)]
 #[brw(little)]
 pub struct PlaylistTreeNode {
     /// ID of parent row of this row (which means that the parent is a folder).
@@ -717,7 +717,7 @@ pub struct PlaylistTreeNode {
     /// ID of this row.
     pub id: PlaylistTreeNodeId,
     /// Indicates if the node is a folder. Non-zero if it's a leaf node, i.e. a playlist.
-    node_is_folder: u32,
+    pub node_is_folder: u32,
     /// Name of this node, as shown when navigating the menu.
     pub name: DeviceSQLString,
 }
@@ -736,11 +736,11 @@ impl PlaylistTreeNode {
 #[brw(little)]
 pub struct PlaylistEntry {
     /// Position within the playlist.
-    entry_index: u32,
+    pub entry_index: u32,
     /// ID of the track played at this position in the playlist.
-    track_id: TrackId,
+    pub track_id: TrackId,
     /// ID of the playlist.
-    playlist_id: PlaylistTreeNodeId,
+    pub playlist_id: PlaylistTreeNodeId,
 }
 
 /// Contains the kinds of Metadata Categories tracks can be browsed by
@@ -817,7 +817,7 @@ pub struct Track {
     /// Artist row ID for this track (non-zero if set).
     artist_id: ArtistId,
     /// Row ID of this track (non-zero if set).
-    id: TrackId,
+    pub id: TrackId,
     /// Disc number of this track (non-zero if set).
     disc_number: u16,
     /// Number of times this track was played.
