@@ -20,7 +20,7 @@
 
 pub mod string;
 
-use std::{convert::TryInto, default};
+use std::{convert::TryInto, default, io::Cursor};
 
 use crate::pdb::string::DeviceSQLString;
 use crate::util::ColorIndex;
@@ -131,7 +131,7 @@ pub struct Header {
     /// Unknown purpose, perhaps an unoriginal signature, seems to always have the value 0.
     #[br(temp, assert(unknown1 == 0))]
     #[bw(calc = 0u32)]
-    unknown1: u32,
+    pub unknown1: u32,
     /// Size of a single page in bytes.
     ///
     /// The byte offset of a page can be calculated by multiplying a page index with this value.
@@ -139,19 +139,19 @@ pub struct Header {
     /// Number of tables.
     #[br(temp)]
     #[bw(calc = tables.len().try_into().expect("too many tables"))]
-    num_tables: u32,
+    pub num_tables: u32,
     /// Unknown field, not used as any `empty_candidate`, points past end of file.
     #[allow(dead_code)]
-    next_unused_page: PageIndex,
+    pub next_unused_page: PageIndex,
     /// Unknown field.
     #[allow(dead_code)]
-    unknown: u32,
+    pub unknown: u32,
     /// Always incremented by at least one, sometimes by two or three.
     pub sequence: u32,
     /// The gap seems to be always zero.
     #[br(temp, assert(gap == 0))]
     #[bw(calc = 0u32)]
-    gap: u32,
+    pub gap: u32,
     /// Each table is a linked list of pages containing rows of a particular type.
     #[br(count = num_tables)]
     pub tables: Vec<Table>,
@@ -346,6 +346,100 @@ pub struct Page {
 impl Page {
     /// Size of the page header in bytes.
     pub const HEADER_SIZE: u32 = 0x28;
+
+    /// Build a page and precompute all writable header fields.
+    pub fn from_row_groups(
+        page_index: PageIndex,
+        page_type: PageType,
+        next_page: PageIndex,
+        row_groups: Vec<RowGroup>,
+        page_size: u32,
+    ) -> binrw::BinResult<Self> {
+        // 1) Count rows
+        let total_rows: u16 = row_groups
+            .iter()
+            .map(|rg| rg.rows.len() as u16)
+            .sum();
+
+        // 2) Choose small/large counters to satisfy the reader rule
+        let (num_rows_small, num_rows_large) = if total_rows <= u8::MAX as u16 {
+            (total_rows as u8, total_rows)
+        } else {
+            (u8::MAX, total_rows) // large > small, not 0x1FFF
+        };
+
+        // 3) Compute heap capacity and encoded usage
+        let footer_pad = Self::heap_padding_size(page_size, (total_rows.div_ceil(RowGroup::MAX_ROW_COUNT as u16)) as u16);
+        let heap_capacity = page_size - Self::HEADER_SIZE - footer_pad;
+        let encoded_used: u32 = Self::encoded_heap_len(page_size, &row_groups)?;
+
+        if encoded_used > heap_capacity {
+            // caller packed too much into this page
+            return Err(binrw::Error::AssertFail {
+                pos: 0,
+                message: format!("page {:?} overflow: used {} > capacity {}", page_index, encoded_used, heap_capacity),
+            });
+        }
+
+        let used_size: u16 = encoded_used as u16;
+        let free_size: u16 = (heap_capacity - encoded_used) as u16;
+
+        // 4) Flags: mark as data page if any rows
+        let page_flags = match total_rows > 0 {
+            true => PageFlags(0x44),
+            false => PageFlags(0x00),
+        };
+
+        // 5) Unknowns set to zero
+        Ok(Page {
+            page_index,
+            page_type,
+            next_page,
+            unknown1: 0,
+            unknown2: 0,
+            num_rows_small,
+            unknown3: 0,
+            unknown4: 0,
+            page_flags,
+            free_size,
+            used_size,
+            unknown5: 0,
+            num_rows_large,
+            unknown6: 0,
+            unknown7: 0,
+            row_groups,
+        })
+    }
+
+    fn encoded_heap_len(
+        page_size: u32,
+        groups: &Vec<RowGroup>,
+    ) -> binrw::BinResult<u32> {
+        let mut scratch = Cursor::new(Vec::<u8>::new());
+        Self::write_page_contents(&mut scratch, page_size, groups)?;
+        Ok(scratch.get_ref().len() as u32)
+    }
+
+    fn write_page_contents<W: Write + Seek>(
+        writer: &mut W,
+        page_size: u32,
+        row_groups: &Vec<RowGroup>,
+    ) -> BinResult<()> {
+        let header_end_pos = writer.stream_position()?;
+        let mut relative_row_offset: u64 = 0;
+
+        // Seek to the very end of the page
+        writer.seek(SeekFrom::Current((page_size - Page::HEADER_SIZE).into()))?;
+
+        for row_group in row_groups {
+            relative_row_offset = row_group.write_options_and_get_row_offset(
+                writer,
+                Endian::Little,
+                (header_end_pos, relative_row_offset),
+            )?;
+        }
+        Ok(())
+    }
 
     /// Calculate the size of the empty space between the header and the footer.
     fn heap_padding_size(page_size: u32, num_row_groups: u16) -> u32 {
@@ -584,24 +678,24 @@ pub struct Album {
     /// **Note:** This is a virtual field and not actually read from the file.
     #[br(temp, parse_with = current_offset)]
     #[bw(ignore)]
-    base_offset: u64,
+    pub base_offset: u64,
     /// Unknown field, usually `80 00`.
-    unknown1: u16,
+    pub unknown1: u16,
     /// Unknown field, called `index_shift` by [@flesniak](https://github.com/flesniak).
-    index_shift: u16,
+    pub index_shift: u16,
     /// Unknown field.
-    unknown2: u32,
+    pub unknown2: u32,
     /// ID of the artist row associated with this row.
-    artist_id: ArtistId,
+    pub artist_id: ArtistId,
     /// ID of this row.
-    id: AlbumId,
+    pub id: AlbumId,
     /// Unknown field.
-    unknown3: u32,
+    pub unknown3: u32,
     /// Unknown field.
-    unknown4: u8,
+    pub unknown4: u8,
     /// Album name String
     #[br(offset = base_offset, parse_with = FilePtr8::parse)]
-    name: DeviceSQLString,
+    pub name: DeviceSQLString,
 }
 
 /// Contains the artist name and ID.
@@ -610,25 +704,25 @@ pub struct Album {
 #[brw(little)]
 pub struct Artist {
     /// Determines if the `name` string is located at the 8-bit offset (0x60) or the 16-bit offset (0x64).
-    subtype: u16,
+    pub subtype: u16,
     /// Unknown field, called `index_shift` by [@flesniak](https://github.com/flesniak).
-    index_shift: u16,
+    pub index_shift: u16,
     /// ID of this row.
-    id: ArtistId,
+    pub id: ArtistId,
     /// Unknown field.
-    unknown1: u8,
+    pub unknown1: u8,
     /// One-byte name offset used if `subtype` is `0x60`.
-    ofs_name_near: u8,
+    pub ofs_name_near: u8,
     /// Two-byte name offset used if `subtype` is `0x64`.
     ///
     /// In that case, the value of `ofs_name_near` is ignored
     #[br(if(subtype == 0x64))]
-    ofs_name_far: Option<u16>,
+    pub ofs_name_far: Option<u16>,
     /// Name of this artist.
     #[br(seek_before = Artist::calculate_name_seek(ofs_name_near, &ofs_name_far))]
     #[bw(seek_before = Artist::calculate_name_seek(*ofs_name_near, ofs_name_far))]
     #[brw(restore_position)]
-    name: DeviceSQLString,
+    pub name: DeviceSQLString,
 }
 
 impl Artist {
@@ -644,9 +738,9 @@ impl Artist {
 #[brw(little)]
 pub struct Artwork {
     /// ID of this row.
-    id: ArtworkId,
+    pub id: ArtworkId,
     /// Path to the album art file.
-    path: DeviceSQLString,
+    pub path: DeviceSQLString,
 }
 
 /// Contains numeric color ID
@@ -655,15 +749,15 @@ pub struct Artwork {
 #[brw(little)]
 pub struct Color {
     /// Unknown field.
-    unknown1: u32,
+    pub unknown1: u32,
     /// Unknown field.
-    unknown2: u8,
+    pub unknown2: u8,
     /// Numeric color ID
-    color: ColorIndex,
+    pub color: ColorIndex,
     /// Unknown field.
-    unknown3: u16,
+    pub unknown3: u16,
     /// User-defined name of the color.
-    name: DeviceSQLString,
+    pub name: DeviceSQLString,
 }
 
 /// Represents a musical genre.
@@ -672,9 +766,9 @@ pub struct Color {
 #[brw(little)]
 pub struct Genre {
     /// ID of this row.
-    id: GenreId,
+    pub id: GenreId,
     /// Name of the genre.
-    name: DeviceSQLString,
+    pub name: DeviceSQLString,
 }
 
 /// Represents a history playlist.
@@ -683,9 +777,9 @@ pub struct Genre {
 #[brw(little)]
 pub struct HistoryPlaylist {
     /// ID of this row.
-    id: HistoryPlaylistId,
+    pub id: HistoryPlaylistId,
     /// Name of the playlist.
-    name: DeviceSQLString,
+    pub name: DeviceSQLString,
 }
 
 /// Represents a history playlist.
@@ -694,11 +788,11 @@ pub struct HistoryPlaylist {
 #[brw(little)]
 pub struct HistoryEntry {
     /// ID of the track played at this position in the playlist.
-    track_id: TrackId,
+    pub track_id: TrackId,
     /// ID of the history playlist.
-    playlist_id: HistoryPlaylistId,
+    pub playlist_id: HistoryPlaylistId,
     /// Position within the playlist.
-    entry_index: u32,
+    pub entry_index: u32,
 }
 
 /// Represents a musical key.
@@ -707,11 +801,11 @@ pub struct HistoryEntry {
 #[brw(little)]
 pub struct Key {
     /// ID of this row.
-    id: KeyId,
+    pub id: KeyId,
     /// Apparently a second copy of the row ID.
-    id2: u32,
+    pub id2: u32,
     /// Name of the key.
-    name: DeviceSQLString,
+    pub name: DeviceSQLString,
 }
 
 /// Represents a record label.
@@ -720,9 +814,9 @@ pub struct Key {
 #[brw(little)]
 pub struct Label {
     /// ID of this row.
-    id: LabelId,
+    pub id: LabelId,
     /// Name of the record label.
-    name: DeviceSQLString,
+    pub name: DeviceSQLString,
 }
 
 /// Represents a node in the playlist tree (either a folder or a playlist).
