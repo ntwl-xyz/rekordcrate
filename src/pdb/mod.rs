@@ -20,14 +20,12 @@
 
 pub mod string;
 
-use std::{convert::TryInto, default, io::Cursor};
+use std::{convert::TryInto, io::Cursor};
 
 use crate::pdb::string::DeviceSQLString;
 use crate::util::ColorIndex;
 use binrw::{
-    binread, binrw,
-    io::{Read, Seek, SeekFrom, Write},
-    BinRead, BinResult, BinWrite, Endian, FilePtr16, FilePtr8,
+    binread, binrw, io::{Read, Seek, SeekFrom, Write}, BinRead, BinResult, BinWrite, Endian, Error, FilePtr16, FilePtr8
 };
 
 /// Do not read anything, but the return the current stream position of `reader`.
@@ -347,13 +345,88 @@ impl Page {
     /// Size of the page header in bytes.
     pub const HEADER_SIZE: u32 = 0x28;
 
+    /// Pack rows into pages. Last page has `next_page = PageIndex(0)`; set real
+    /// `next_page` later when you know `next_unused_page`.
+    pub fn from_rows(
+        page_type: PageType,
+        start_index: u32,
+        page_size: u16,
+        rows: impl IntoIterator<Item = Row>,
+    ) -> binrw::BinResult<Vec<Page>> {
+        const MAX_IN_GROUP: usize = 16;
+
+        let mut pages: Vec<Page> = Vec::new();
+        let mut rgs: Vec<RowGroup> = Vec::new();
+        let mut rg: RowGroup = RowGroup::default();
+
+        let finish_page = |page_idx: u32, rgs: Vec<RowGroup>, used_size: u16| -> binrw::BinResult<Page> {
+            println!("finishing page rgs={:?}", rgs.len());
+            println!("finishing page page_size={:?} {:?}", page_size, used_size);
+            let page = Page::from_row_groups(
+                PageIndex(page_idx),
+                page_type,
+                PageIndex(0), // patch later
+                rgs,
+                page_size,
+                used_size,
+            )?;
+            Ok(page)
+        };
+
+        let mut page_idx = start_index;
+        let _rgs_mut: &mut Vec<RowGroup> = rgs.as_mut();
+
+        for row in rows {
+            rg.add_row(row).unwrap();
+            rgs.push(rg);
+            let used_size = Self::page_used_size(page_size, &rgs)?;
+
+            if used_size > page_size {
+                let next_row = rgs.last_mut().expect("no last rg").pop_row().expect("no last row");
+                let used_size = Self::page_used_size(page_size, &rgs)?;
+                finish_page(page_idx, rgs, used_size)?;
+                rg = RowGroup::default();
+                rgs = Vec::new();
+                rg.add_row(next_row).expect("failed to add row");
+                page_idx += 1;
+            } else {
+                // pop the last rg out so we can keep adding to it
+                rg = rgs.pop().expect("no last rg");
+
+                if rg.rows.len() == MAX_IN_GROUP {
+                    rgs.push(rg);
+                    let used_size = Self::page_used_size(page_size, &rgs)?;
+                    finish_page(page_idx, rgs, used_size)?;
+                    rg = RowGroup::default();
+                    rgs = Vec::new();
+                    page_idx += 1;
+                }
+            }
+        }
+
+        let used_size = Self::page_used_size(page_size, &rgs)?;
+        finish_page(page_idx, rgs, used_size)?;
+
+        Ok(pages)
+    }
+
+    fn page_used_size(
+        page_size: u16,
+        rgs: &Vec<RowGroup>,
+    ) -> Result<u16, Error> {
+        let mut scratch = binrw::io::Cursor::new(Vec::<u8>::new());
+        write_page_contents(&rgs, &mut scratch, Endian::Little, (page_size.into(),))?;
+        Ok(scratch.get_ref().len() as u16)
+    }
+
     /// Build a page and precompute all writable header fields.
     pub fn from_row_groups(
         page_index: PageIndex,
         page_type: PageType,
         next_page: PageIndex,
         row_groups: Vec<RowGroup>,
-        page_size: u32,
+        page_size: u16,
+        used_size: u16,
     ) -> binrw::BinResult<Self> {
         // 1) Count rows
         let total_rows: u16 = row_groups
@@ -368,21 +441,7 @@ impl Page {
             (u8::MAX, total_rows) // large > small, not 0x1FFF
         };
 
-        // 3) Compute heap capacity and encoded usage
-        let footer_pad = Self::heap_padding_size(page_size, (total_rows.div_ceil(RowGroup::MAX_ROW_COUNT as u16)) as u16);
-        let heap_capacity = page_size - Self::HEADER_SIZE - footer_pad;
-        let encoded_used: u32 = Self::encoded_heap_len(page_size, &row_groups)?;
-
-        if encoded_used > heap_capacity {
-            // caller packed too much into this page
-            return Err(binrw::Error::AssertFail {
-                pos: 0,
-                message: format!("page {:?} overflow: used {} > capacity {}", page_index, encoded_used, heap_capacity),
-            });
-        }
-
-        let used_size: u16 = encoded_used as u16;
-        let free_size: u16 = (heap_capacity - encoded_used) as u16;
+        let free_size: u16 = page_size - used_size;
 
         // 4) Flags: mark as data page if any rows
         let page_flags = match total_rows > 0 {
@@ -409,36 +468,6 @@ impl Page {
             unknown7: 0,
             row_groups,
         })
-    }
-
-    fn encoded_heap_len(
-        page_size: u32,
-        groups: &Vec<RowGroup>,
-    ) -> binrw::BinResult<u32> {
-        let mut scratch = Cursor::new(Vec::<u8>::new());
-        Self::write_page_contents(&mut scratch, page_size, groups)?;
-        Ok(scratch.get_ref().len() as u32)
-    }
-
-    fn write_page_contents<W: Write + Seek>(
-        writer: &mut W,
-        page_size: u32,
-        row_groups: &Vec<RowGroup>,
-    ) -> BinResult<()> {
-        let header_end_pos = writer.stream_position()?;
-        let mut relative_row_offset: u64 = 0;
-
-        // Seek to the very end of the page
-        writer.seek(SeekFrom::Current((page_size - Page::HEADER_SIZE).into()))?;
-
-        for row_group in row_groups {
-            relative_row_offset = row_group.write_options_and_get_row_offset(
-                writer,
-                Endian::Little,
-                (header_end_pos, relative_row_offset),
-            )?;
-        }
-        Ok(())
     }
 
     /// Calculate the size of the empty space between the header and the footer.
@@ -476,7 +505,7 @@ impl Page {
 /// table.
 #[binread]
 #[br(import(page_type: PageType, page_heap_position: u64))]
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct RowGroup {
     /// An offset which points to a row in the table, whose actual presence is controlled by one of the
     /// bits in `row_present_flags`. This instance allows the row itself to be lazily loaded, unless it
@@ -518,6 +547,18 @@ impl RowGroup {
         self.row_presence_flags |= 1 << self.rows.len() as u16;
         self.rows.push(row);
         Ok(())
+    }
+
+    /// Pop a row from this rg and adjust the presence flags
+    pub fn pop_row(&mut self) -> Option<Row> {
+        match self.rows.pop() {
+            Some(row) => {
+                let idx = self.rows.len() as u16;
+                self.row_presence_flags &= !(1u16 << idx);
+                Some(row)
+            }
+            None => None,
+        }
     }
 
     fn present_rows_offsets(
@@ -563,6 +604,8 @@ impl RowGroup {
         let (heap_start, relative_row_offset) = args;
 
         let rows_to_write_count = self.present_rows().len();
+
+        println!("{:?} -> {:?}", rows_to_write_count, self.row_presence_flags.count_ones() as usize);
 
         // The number of flags set should match the number of present rows.
         if rows_to_write_count != self.row_presence_flags.count_ones() as usize {
