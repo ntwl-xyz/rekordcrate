@@ -121,6 +121,76 @@ pub struct Table {
     pub last_page: PageIndex,
 }
 
+impl Table {
+        /// Pack rows into pages. Last page has `next_page = PageIndex(0)`; set real
+    /// `next_page` later when you know `next_unused_page`.
+    pub fn from_rows(
+        page_type: PageType,
+        start_index: u32,
+        page_size: u16,
+        rows: impl IntoIterator<Item = Row>,
+    ) -> binrw::BinResult<Vec<Page>> {
+        const MAX_IN_GROUP: usize = 16;
+        let mut pages: Vec<Page> = Vec::new();
+        let mut rgs = vec![RowGroup::default()];
+        let mut page_idx = start_index;
+
+        for row in rows {
+            // add the row to the last rg and size up the page
+            rgs.last_mut().expect("no last rg").add_row(row).expect("failed to add row");
+            let used_size = Page::heap_size(page_size, &rgs)?;
+
+            if used_size > page_size {
+                // if the page is too big now pop the row back out
+                let next_row = rgs.last_mut().expect("no last rg").pop_row().expect("no next row");
+
+                // get the new page size without the last row
+                let used_size = Page::heap_size(page_size, &rgs)?;
+                // finish the current page and then reset the rgs
+                pages.push(Page::from_row_groups(
+                    page_type,
+                    PageIndex(page_idx),
+                    PageIndex(page_idx.checked_add(1).expect("way way wayy too many pages")),
+                    rgs,
+                    page_size,
+                    used_size,
+                )?);
+                page_idx += 1;
+                rgs = vec![RowGroup::default()];
+                rgs.last_mut().expect("no last rg").add_row(next_row).expect("failed to add next row");
+            } else {
+                let rg = rgs.last().expect("no last rg");
+                // finish the page if we hit the max row count
+                if rg.rows.len() == MAX_IN_GROUP {
+                    pages.push(Page::from_row_groups(
+                        page_type,
+                        PageIndex(page_idx),
+                        PageIndex(page_idx.checked_add(1).expect("way way wayy too many pages")),
+                        rgs,
+                        page_size,
+                        used_size,
+                    )?);
+                    page_idx += 1;
+                    rgs = vec![RowGroup::default()];
+                }
+            }
+        }
+
+        // finalise the last page with the current page index as the last
+        let used_size = Page::heap_size(page_size, &rgs)?;
+        pages.push(Page::from_row_groups(
+            page_type,
+            PageIndex(page_idx),
+            PageIndex(page_idx),
+            rgs,
+            page_size,
+            used_size,
+        )?);
+
+        Ok(pages)
+    }
+}
+
 /// The PDB header structure, including the list of tables.
 #[binrw]
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -345,72 +415,7 @@ impl Page {
     /// Size of the page header in bytes.
     pub const HEADER_SIZE: u32 = 0x28;
 
-    /// Pack rows into pages. Last page has `next_page = PageIndex(0)`; set real
-    /// `next_page` later when you know `next_unused_page`.
-    pub fn from_rows(
-        page_type: PageType,
-        start_index: u32,
-        page_size: u16,
-        rows: impl IntoIterator<Item = Row>,
-    ) -> binrw::BinResult<Vec<Page>> {
-        const MAX_IN_GROUP: usize = 16;
-
-        let mut pages: Vec<Page> = Vec::new();
-        let mut rgs: Vec<RowGroup> = Vec::new();
-        let mut rg: RowGroup = RowGroup::default();
-
-        let finish_page = |page_idx: u32, rgs: Vec<RowGroup>, used_size: u16| -> binrw::BinResult<Page> {
-            println!("finishing page rgs={:?}", rgs.len());
-            println!("finishing page page_size={:?} {:?}", page_size, used_size);
-            let page = Page::from_row_groups(
-                PageIndex(page_idx),
-                page_type,
-                PageIndex(0), // patch later
-                rgs,
-                page_size,
-                used_size,
-            )?;
-            Ok(page)
-        };
-
-        let mut page_idx = start_index;
-        let _rgs_mut: &mut Vec<RowGroup> = rgs.as_mut();
-
-        for row in rows {
-            rg.add_row(row).unwrap();
-            rgs.push(rg);
-            let used_size = Self::page_used_size(page_size, &rgs)?;
-
-            if used_size > page_size {
-                let next_row = rgs.last_mut().expect("no last rg").pop_row().expect("no last row");
-                let used_size = Self::page_used_size(page_size, &rgs)?;
-                finish_page(page_idx, rgs, used_size)?;
-                rg = RowGroup::default();
-                rgs = Vec::new();
-                rg.add_row(next_row).expect("failed to add row");
-                page_idx += 1;
-            } else {
-                // pop the last rg out so we can keep adding to it
-                rg = rgs.pop().expect("no last rg");
-
-                if rg.rows.len() == MAX_IN_GROUP {
-                    rgs.push(rg);
-                    let used_size = Self::page_used_size(page_size, &rgs)?;
-                    finish_page(page_idx, rgs, used_size)?;
-                    rg = RowGroup::default();
-                    rgs = Vec::new();
-                    page_idx += 1;
-                }
-            }
-        }
-
-        let used_size = Self::page_used_size(page_size, &rgs)?;
-        finish_page(page_idx, rgs, used_size)?;
-
-        Ok(pages)
-    }
-
-    fn page_used_size(
+    fn heap_size(
         page_size: u16,
         rgs: &Vec<RowGroup>,
     ) -> Result<u16, Error> {
@@ -421,8 +426,8 @@ impl Page {
 
     /// Build a page and precompute all writable header fields.
     pub fn from_row_groups(
-        page_index: PageIndex,
         page_type: PageType,
+        page_index: PageIndex,
         next_page: PageIndex,
         row_groups: Vec<RowGroup>,
         page_size: u16,
