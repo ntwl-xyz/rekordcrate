@@ -20,7 +20,8 @@
 
 pub mod string;
 
-use std::{convert::TryInto, io::Cursor};
+use std::{convert::TryInto};
+use thiserror::Error;
 
 use crate::pdb::string::DeviceSQLString;
 use crate::util::ColorIndex;
@@ -122,14 +123,14 @@ pub struct Table {
 }
 
 impl Table {
-        /// Pack rows into pages. Last page has `next_page = PageIndex(0)`; set real
-    /// `next_page` later when you know `next_unused_page`.
+    /// create a table from a collection of rows.
+    /// the resulting pages are ordered linearly
     pub fn from_rows(
         page_type: PageType,
         start_index: u32,
         page_size: u16,
         rows: impl IntoIterator<Item = Row>,
-    ) -> binrw::BinResult<Vec<Page>> {
+    ) -> Result<Vec<Page>, PageError> {
         const MAX_IN_GROUP: usize = 16;
         let mut pages: Vec<Page> = Vec::new();
         let mut rgs = vec![RowGroup::default()];
@@ -137,54 +138,54 @@ impl Table {
 
         for row in rows {
             // add the row to the last rg and size up the page
-            rgs.last_mut().expect("no last rg").add_row(row).expect("failed to add row");
-            let used_size = Page::heap_size(page_size, &rgs)?;
-
-            if used_size > page_size {
-                // if the page is too big now pop the row back out
-                let next_row = rgs.last_mut().expect("no last rg").pop_row().expect("no next row");
-
-                // get the new page size without the last row
-                let used_size = Page::heap_size(page_size, &rgs)?;
-                // finish the current page and then reset the rgs
-                pages.push(Page::from_row_groups(
-                    page_type,
-                    PageIndex(page_idx),
-                    PageIndex(page_idx.checked_add(1).expect("way way wayy too many pages")),
-                    rgs,
-                    page_size,
-                    used_size,
-                )?);
-                page_idx += 1;
-                rgs = vec![RowGroup::default()];
-                rgs.last_mut().expect("no last rg").add_row(next_row).expect("failed to add next row");
-            } else {
-                let rg = rgs.last().expect("no last rg");
-                // finish the page if we hit the max row count
-                if rg.rows.len() == MAX_IN_GROUP {
+            match rgs.last_mut().expect("no last rg").add_row(row) {
+                Ok(_) => (),
+                Err(PageError::RowTooBig) => {
                     pages.push(Page::from_row_groups(
                         page_type,
                         PageIndex(page_idx),
                         PageIndex(page_idx.checked_add(1).expect("way way wayy too many pages")),
-                        rgs,
+                        &rgs,
                         page_size,
-                        used_size,
                     )?);
                     page_idx += 1;
                     rgs = vec![RowGroup::default()];
-                }
+                },
+                Err(e) => return Err(e)
+            };
+
+            match Page::from_row_groups(
+                page_type,
+                PageIndex(page_idx),
+                PageIndex(page_idx.checked_add(1).expect("way way wayy too many pages")),
+                &rgs,
+                page_size,
+            ) {
+                Ok(_) => continue,
+                Err(PageError::Oversized) => {
+                    let next_row = rgs.last_mut().expect("no last rg").pop_row().expect("no next row");
+                    pages.push(Page::from_row_groups(
+                        page_type,
+                        PageIndex(page_idx),
+                        PageIndex(page_idx.checked_add(1).expect("way way wayy too many pages")),
+                        &rgs,
+                        page_size,
+                    )?);
+                    page_idx += 1;
+                    rgs = vec![RowGroup::default()];
+                    rgs.last_mut().expect("no last rg").add_row(next_row).expect("failed to add next row");
+                },
+                Err(e) => return Err(e),
             }
         }
 
-        // finalise the last page with the current page index as the last
-        let used_size = Page::heap_size(page_size, &rgs)?;
+        // finalise the last page with the next page pointing at itself
         pages.push(Page::from_row_groups(
             page_type,
             PageIndex(page_idx),
             PageIndex(page_idx),
-            rgs,
+            &rgs,
             page_size,
-            used_size,
         )?);
 
         Ok(pages)
@@ -411,16 +412,28 @@ pub struct Page {
     pub row_groups: Vec<RowGroup>,
 }
 
+/// Error Objects occurring when dealing with [Pages]'s
+#[derive(Debug, PartialEq, Eq, Copy, Clone, Error)]
+#[non_exhaustive]
+pub enum PageError {
+    #[error("Page encoded length exceeds page size")]
+    Oversized,
+    #[error("A RowGroup in the page contains too many Rows")]
+    RowTooBig,
+    #[error("Couldn't serialise something")]
+    Serialization,
+    #[error("Couldn't serialise something")]
+    Deserialization,
+}
+
 impl Page {
     /// Size of the page header in bytes.
     pub const HEADER_SIZE: u32 = 0x28;
 
-    fn heap_size(
-        page_size: u16,
-        rgs: &Vec<RowGroup>,
-    ) -> Result<u16, Error> {
+    fn heap_size(page_size: u16, rgs: &Vec<RowGroup>) -> Result<u16, PageError> {
         let mut scratch = binrw::io::Cursor::new(Vec::<u8>::new());
-        write_page_contents(&rgs, &mut scratch, Endian::Little, (page_size.into(),))?;
+        write_page_contents(&rgs, &mut scratch, Endian::Little, (page_size.into(),))
+            .map_err(|_| PageError::Serialization)?;
         Ok(scratch.get_ref().len() as u16)
     }
 
@@ -429,10 +442,15 @@ impl Page {
         page_type: PageType,
         page_index: PageIndex,
         next_page: PageIndex,
-        row_groups: Vec<RowGroup>,
+        row_groups: &Vec<RowGroup>,
         page_size: u16,
-        used_size: u16,
-    ) -> binrw::BinResult<Self> {
+    ) -> Result<Self, PageError> {
+        let used_size = Self::heap_size(page_size, row_groups)?;
+        let free_size = match page_size.checked_sub(used_size) {
+            Some(s) => s,
+            None => return Err(PageError::Oversized),
+        };
+
         // 1) Count rows
         let total_rows: u16 = row_groups
             .iter()
@@ -446,16 +464,13 @@ impl Page {
             (u8::MAX, total_rows) // large > small, not 0x1FFF
         };
 
-        let free_size: u16 = page_size - used_size;
-
         // 4) Flags: mark as data page if any rows
         let page_flags = match total_rows > 0 {
             true => PageFlags(0x44),
             false => PageFlags(0x00),
         };
 
-        // 5) Unknowns set to zero
-        Ok(Page {
+        let page = Page {
             page_index,
             page_type,
             next_page,
@@ -471,8 +486,24 @@ impl Page {
             num_rows_large,
             unknown6: 0,
             unknown7: 0,
-            row_groups,
-        })
+            row_groups: row_groups.clone(),
+        };
+
+        let mut scratch = binrw::io::Cursor::new(Vec::<u8>::new());
+        let args: (u32,) = (page_size.into(),);
+        page.write_options(&mut scratch, Endian::Little, args).map_err(|_| PageError::Serialization)?;
+        write_page_contents(&row_groups, &mut scratch, Endian::Little, (page_size.into(),))
+            .map_err(|_| PageError::Serialization)?;
+        scratch.rewind().expect("couldn't rewind");
+
+        println!("{:?}", scratch);
+        match Page::read_options(&mut scratch, Endian::Little, (page_size.into(),)) {
+            Ok(page) => Ok(page),
+            Err(e) => {
+                println!("{:?}", e);
+                return Err(PageError::Deserialization);
+            }
+        }
     }
 
     /// Calculate the size of the empty space between the header and the footer.
@@ -541,13 +572,10 @@ impl RowGroup {
     pub fn present_rows(&self) -> &[Row] {
         &self.rows
     }
-    // TODO(Swiftb0y): Add a new error category for user APIs and add the correct
-    // error herer
-    #[allow(clippy::result_unit_err)]
     /// Add a row to this rowgroup
-    pub fn add_row(&mut self, row: Row) -> Result<(), ()> {
+    pub fn add_row(&mut self, row: Row) -> Result<(), PageError> {
         if self.rows.len() >= Self::MAX_ROW_COUNT {
-            return Err(());
+            return Err(PageError::RowTooBig);
         }
         self.row_presence_flags |= 1 << self.rows.len() as u16;
         self.rows.push(row);
