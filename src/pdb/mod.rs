@@ -20,8 +20,8 @@
 
 pub mod string;
 
+use crate::util::RekordcrateError;
 use std::{convert::TryInto};
-use thiserror::Error;
 
 use crate::pdb::string::DeviceSQLString;
 use crate::util::ColorIndex;
@@ -130,7 +130,7 @@ impl Table {
         start_index: u32,
         page_size: u16,
         rows: impl IntoIterator<Item = Row>,
-    ) -> Result<(Self, Vec<Page>), PageError> {
+    ) -> Result<(Self, Vec<Page>, u32), RekordcrateError> {
         let mut pages: Vec<Page> = Vec::new();
         let mut rgs = vec![RowGroup::default()];
         let mut page_idx = start_index;
@@ -151,7 +151,7 @@ impl Table {
             // add the row to the last rg and size up the page
             match rgs.last_mut().expect("no last rg").add_row(row) {
                 Ok(_) => (),
-                Err(PageError::RowTooBig) => {
+                Err(RekordcrateError::RowGroupOverflowError) => {
                     pages.push(Page::from_row_groups(
                         page_type,
                         PageIndex(page_idx),
@@ -173,7 +173,7 @@ impl Table {
                 page_size,
             ) {
                 Ok(_) => continue,
-                Err(PageError::Oversized) => {
+                Err(RekordcrateError::PageOverflowError) => {
                     let next_row = rgs.last_mut().expect("no last rg").pop_row().expect("no next row");
                     pages.push(Page::from_row_groups(
                         page_type,
@@ -199,11 +199,8 @@ impl Table {
             page_size,
         )?);
 
-        println!("{:?}", pages);
-
         let table = Table { page_type, empty_candidate: 0, first_page: PageIndex(first_page), last_page: PageIndex(page_idx) };
-
-        Ok((table, pages))
+        Ok((table, pages, page_idx + 1))
     }
 }
 
@@ -263,23 +260,13 @@ impl Header {
     ) -> BinResult<Vec<Page>> {
         let endian = Endian::Little;
         let (first_page, last_page) = args;
-
-        println!("{:?}", first_page);
-        println!("{:?}", last_page);
-
         let mut pages = vec![];
         let mut page_index = first_page.clone();
         loop {
             let page_offset = SeekFrom::Start(page_index.offset(self.page_size));
-            println!("{:?}", page_offset);
-
             reader.seek(page_offset).map_err(binrw::Error::Io)?;
             let page = Page::read_options(reader, endian, (self.page_size,))?;
             let is_last_page = &page.page_index == last_page;
-            println!("{:?}", page);
-            // println!("{:?}", is_last_page);
-            // println!("{:?}", page.page_index);
-            // println!("{:?}", last_page);
             page_index = page.next_page.clone();
             pages.push(page);
 
@@ -436,25 +423,12 @@ pub struct Page {
     pub row_groups: Vec<RowGroup>,
 }
 
-/// Error Objects occurring when dealing with [Pages]'s
-#[derive(Debug, PartialEq, Eq, Copy, Clone, Error)]
-#[non_exhaustive]
-pub enum PageError {
-    #[error("Page encoded length exceeds page size")]
-    Oversized,
-    #[error("A RowGroup in the page contains too many Rows")]
-    RowTooBig,
-    #[error("Couldn't serialise something")]
-    Serialization,
-    #[error("Couldn't serialise something")]
-    Deserialization,
-}
 
 impl Page {
     /// Size of the page header in bytes.
     pub const HEADER_SIZE: u32 = 0x28;
 
-    fn heap_size(page_size: u16, rgs: &Vec<RowGroup>) -> Result<u16, PageError> {
+    fn heap_size(page_size: u16, rgs: &Vec<RowGroup>) -> Result<u16, RekordcrateError> {
         let mut scratch = binrw::io::Cursor::new(Vec::<u8>::new());
         let header_end_pos = scratch.stream_position().unwrap();
 
@@ -481,11 +455,11 @@ impl Page {
         next_page: PageIndex,
         row_groups: &Vec<RowGroup>,
         page_size: u16,
-    ) -> Result<Self, PageError> {
+    ) -> Result<Self, RekordcrateError> {
         let used_size = Self::heap_size(page_size, row_groups)?;
         let free_size = match page_size.checked_sub(used_size) {
             Some(s) => s,
-            None => return Err(PageError::Oversized),
+            None => return Err(RekordcrateError::PageOverflowError),
         };
 
         // 1) Count rows
@@ -528,14 +502,14 @@ impl Page {
 
         // let mut scratch = binrw::io::Cursor::new(Vec::<u8>::new());
         // let args: (u32,) = (page_size.into(),);
-        // page.write_options(&mut scratch, Endian::Little, args).map_err(|_| PageError::Serialization)?;
+        // page.write_options(&mut scratch, Endian::Little, args).map_err(|_| RekordcrateError::Serialization)?;
         // scratch.rewind().expect("couldn't rewind");
 
         // let page = match Page::read_options(&mut scratch, Endian::Little, (page_size.into(),)) {
         //     Ok(page) => page,
         //     Err(e) => {
         //         println!("{:?}", e);
-        //         return Err(PageError::Deserialization);
+        //         return Err(RekordcrateError::Deserialization);
         //     }
         // };
 
@@ -611,9 +585,9 @@ impl RowGroup {
         &self.rows
     }
     /// Add a row to this rowgroup
-    pub fn add_row(&mut self, row: Row) -> Result<(), PageError> {
+    pub fn add_row(&mut self, row: Row) -> Result<(), RekordcrateError> {
         if self.rows.len() >= Self::MAX_ROW_COUNT {
-            return Err(PageError::RowTooBig);
+            return Err(RekordcrateError::RowGroupOverflowError);
         }
         self.row_presence_flags |= 1 << self.rows.len() as u16;
         self.rows.push(row);

@@ -27,6 +27,15 @@ pub enum RekordcrateError {
     /// Represents an `std::io::Error`.
     #[error(transparent)]
     IOError(#[from] std::io::Error),
+
+    /// Page exceeded supplied page size
+    #[error("Page encoded length exceeds page size")]
+    PageOverflowError,
+
+    /// RowGroup contained too many rows
+    #[error("A RowGroup in the page contains too many Rows")]
+    RowGroupOverflowError,
+
 }
 
 /// Type alias for results where the error is a `RekordcrateError`.
@@ -34,7 +43,7 @@ pub type RekordcrateResult<T> = std::result::Result<T, RekordcrateError>;
 
 /// Indexed Color identifiers used for memory cues and tracks.
 #[binrw]
-#[derive(Debug, PartialEq, Eq, Clone)]
+#[derive(Debug, PartialEq, Eq, Clone, PartialOrd, Ord)]
 pub enum ColorIndex {
     /// No color.
     #[brw(magic = 0u8)]
