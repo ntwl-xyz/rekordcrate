@@ -26,7 +26,7 @@ use thiserror::Error;
 use crate::pdb::string::DeviceSQLString;
 use crate::util::ColorIndex;
 use binrw::{
-    binread, binrw, io::{Read, Seek, SeekFrom, Write}, BinRead, BinResult, BinWrite, Endian, Error, FilePtr16, FilePtr8
+    binread, binrw, io::{Read, Seek, SeekFrom, Write}, BinRead, BinResult, BinWrite, Endian, FilePtr16, FilePtr8
 };
 
 /// Do not read anything, but the return the current stream position of `reader`.
@@ -130,11 +130,22 @@ impl Table {
         start_index: u32,
         page_size: u16,
         rows: impl IntoIterator<Item = Row>,
-    ) -> Result<Vec<Page>, PageError> {
-        const MAX_IN_GROUP: usize = 16;
+    ) -> Result<(Self, Vec<Page>), PageError> {
         let mut pages: Vec<Page> = Vec::new();
         let mut rgs = vec![RowGroup::default()];
         let mut page_idx = start_index;
+        let first_page = start_index;
+
+        // // push empty first page
+        // // TODO check rows actually has len
+        // pages.push(Page::from_row_groups(
+        //     page_type,
+        //     PageIndex(page_idx),
+        //     PageIndex(page_idx + 1),
+        //     &rgs,
+        //     page_size,
+        // )?);
+        // page_idx += 1;
 
         for row in rows {
             // add the row to the last rg and size up the page
@@ -188,7 +199,11 @@ impl Table {
             page_size,
         )?);
 
-        Ok(pages)
+        println!("{:?}", pages);
+
+        let table = Table { page_type, empty_candidate: 0, first_page: PageIndex(first_page), last_page: PageIndex(page_idx) };
+
+        Ok((table, pages))
     }
 }
 
@@ -249,13 +264,22 @@ impl Header {
         let endian = Endian::Little;
         let (first_page, last_page) = args;
 
+        println!("{:?}", first_page);
+        println!("{:?}", last_page);
+
         let mut pages = vec![];
         let mut page_index = first_page.clone();
         loop {
             let page_offset = SeekFrom::Start(page_index.offset(self.page_size));
+            println!("{:?}", page_offset);
+
             reader.seek(page_offset).map_err(binrw::Error::Io)?;
             let page = Page::read_options(reader, endian, (self.page_size,))?;
             let is_last_page = &page.page_index == last_page;
+            println!("{:?}", page);
+            // println!("{:?}", is_last_page);
+            // println!("{:?}", page.page_index);
+            // println!("{:?}", last_page);
             page_index = page.next_page.clone();
             pages.push(page);
 
@@ -432,9 +456,22 @@ impl Page {
 
     fn heap_size(page_size: u16, rgs: &Vec<RowGroup>) -> Result<u16, PageError> {
         let mut scratch = binrw::io::Cursor::new(Vec::<u8>::new());
-        write_page_contents(&rgs, &mut scratch, Endian::Little, (page_size.into(),))
-            .map_err(|_| PageError::Serialization)?;
-        Ok(scratch.get_ref().len() as u16)
+        let header_end_pos = scratch.stream_position().unwrap();
+
+        let mut relative_row_offset: u64 = 0;
+
+        // Seek to the very end of the page
+        scratch.seek(SeekFrom::Current((page_size - Page::HEADER_SIZE as u16).into())).unwrap();
+
+        for row_group in rgs {
+            relative_row_offset = row_group.write_options_and_get_row_offset(
+                &mut scratch,
+                Endian::Little,
+                (header_end_pos, relative_row_offset),
+            ).unwrap();
+        }
+
+        return Ok(relative_row_offset as u16)
     }
 
     /// Build a page and precompute all writable header fields.
@@ -489,21 +526,22 @@ impl Page {
             row_groups: row_groups.clone(),
         };
 
-        let mut scratch = binrw::io::Cursor::new(Vec::<u8>::new());
-        let args: (u32,) = (page_size.into(),);
-        page.write_options(&mut scratch, Endian::Little, args).map_err(|_| PageError::Serialization)?;
-        write_page_contents(&row_groups, &mut scratch, Endian::Little, (page_size.into(),))
-            .map_err(|_| PageError::Serialization)?;
-        scratch.rewind().expect("couldn't rewind");
+        // let mut scratch = binrw::io::Cursor::new(Vec::<u8>::new());
+        // let args: (u32,) = (page_size.into(),);
+        // page.write_options(&mut scratch, Endian::Little, args).map_err(|_| PageError::Serialization)?;
+        // scratch.rewind().expect("couldn't rewind");
 
-        println!("{:?}", scratch);
-        match Page::read_options(&mut scratch, Endian::Little, (page_size.into(),)) {
-            Ok(page) => Ok(page),
-            Err(e) => {
-                println!("{:?}", e);
-                return Err(PageError::Deserialization);
-            }
-        }
+        // let page = match Page::read_options(&mut scratch, Endian::Little, (page_size.into(),)) {
+        //     Ok(page) => page,
+        //     Err(e) => {
+        //         println!("{:?}", e);
+        //         return Err(PageError::Deserialization);
+        //     }
+        // };
+
+        // println!("{:?}", scratch);
+        // assert_eq!(page.num_rows(), total_rows);
+        Ok(page)
     }
 
     /// Calculate the size of the empty space between the header and the footer.
@@ -637,8 +675,6 @@ impl RowGroup {
         let (heap_start, relative_row_offset) = args;
 
         let rows_to_write_count = self.present_rows().len();
-
-        println!("{:?} -> {:?}", rows_to_write_count, self.row_presence_flags.count_ones() as usize);
 
         // The number of flags set should match the number of present rows.
         if rows_to_write_count != self.row_presence_flags.count_ones() as usize {

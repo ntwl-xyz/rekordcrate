@@ -135,11 +135,11 @@ fn dump_pdb(path: &PathBuf) -> rekordcrate::Result<()> {
     println!("{:#?}", header);
 
     for (i, table) in header.tables.iter().enumerate() {
-        println!("Table {}: {:?}", i, table.page_type);
+        println!("Table {}: {:?} {:?} {:?}", i, table.page_type, table.first_page, table.last_page);
         for page in header
             .read_pages(
                 &mut reader,
-                binrw::Endian::NATIVE,
+                binrw::Endian::Little,
                 (&table.first_page, &table.last_page),
             )
             .unwrap()
